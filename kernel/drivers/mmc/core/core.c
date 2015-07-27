@@ -22,11 +22,12 @@
 #include <linux/scatterlist.h>
 #include <linux/log2.h>
 #include <linux/regulator/consumer.h>
+#include <linux/wakelock.h>
 
-#include <linux/mmc/card.h>
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
+#include <linux/mmc/card.h>
 
 #include "core.h"
 #include "bus.h"
@@ -37,7 +38,48 @@
 #include "sd_ops.h"
 #include "sdio_ops.h"
 
+#include "../host/bcmsdhc.h"
+
+
+#include <linux/mfd/max8986/max8986.h>
+
 static struct workqueue_struct *workqueue;
+static struct wake_lock mmc_delayed_work_wake_lock;
+
+struct regulator_dev {
+	struct regulator_desc *desc;
+	int use_count;
+	int open_count;
+	int exclusive;
+
+	/* lists we belong to */
+	struct list_head list; /* list of all regulators */
+	struct list_head slist; /* list of supplied regulators */
+
+	/* lists we own */
+	struct list_head consumer_list; /* consumers we supply */
+	struct list_head supply_list; /* regulators we supply */
+
+	struct blocking_notifier_head notifier;
+	struct mutex mutex; /* consumer lock */
+	struct module *owner;
+	struct device dev;
+	struct regulation_constraints *constraints;
+	struct regulator_dev *supply;	/* for tree */
+
+	void *reg_data;		/* regulator_dev data */
+};
+
+struct regulator {
+	struct device *dev;
+	struct list_head list;
+	int uA_load;
+	int min_uV;
+	int max_uV;
+	char *supply_name;
+	struct device_attribute dev_attr;
+	struct regulator_dev *rdev;
+};
 
 /*
  * Enabling software CRCs on the data blocks can be a significant (30%)
@@ -69,6 +111,7 @@ MODULE_PARM_DESC(
 static int mmc_schedule_delayed_work(struct delayed_work *work,
 				     unsigned long delay)
 {
+	wake_lock(&mmc_delayed_work_wake_lock);
 	return queue_delayed_work(workqueue, work, delay);
 }
 
@@ -545,9 +588,12 @@ void mmc_host_deeper_disable(struct work_struct *work)
 
 	/* If the host is claimed then we do not want to disable it anymore */
 	if (!mmc_try_claim_host(host))
-		return;
+		goto out;
 	mmc_host_do_disable(host, 1);
 	mmc_do_release_host(host);
+
+out:
+	wake_unlock(&mmc_delayed_work_wake_lock);
 }
 
 /**
@@ -907,12 +953,7 @@ static void mmc_power_up(struct mmc_host *host)
 	 */
 	mmc_delay(10);
 
-	if (host->f_min > 400000) {
-		pr_warning("%s: Minimum clock frequency too high for "
-				"identification mode\n", mmc_hostname(host));
-		host->ios.clock = host->f_min;
-	} else
-		host->ios.clock = 400000;
+	host->ios.clock = host->f_min;
 
 	host->ios.power_mode = MMC_POWER_ON;
 	mmc_set_ios(host);
@@ -976,6 +1017,36 @@ static inline void mmc_bus_put(struct mmc_host *host)
 		__mmc_release_bus(host);
 	spin_unlock_irqrestore(&host->lock, flags);
 }
+
+int mmc_resume_bus(struct mmc_host *host)
+{
+	unsigned long flags;
+
+	if (!mmc_bus_needs_resume(host))
+		return -EINVAL;
+
+	printk("%s: Starting deferred resume\n", mmc_hostname(host));
+	spin_lock_irqsave(&host->lock, flags);
+	host->bus_resume_flags &= ~MMC_BUSRESUME_NEEDS_RESUME;
+	host->rescan_disable = 0;
+	spin_unlock_irqrestore(&host->lock, flags);
+
+	mmc_bus_get(host);
+	if (host->bus_ops && !host->bus_dead) {
+		mmc_power_up(host);
+		BUG_ON(!host->bus_ops->resume);
+		host->bus_ops->resume(host);
+	}
+
+	if (host->bus_ops->detect && !host->bus_dead)
+		host->bus_ops->detect(host);
+
+	mmc_bus_put(host);
+	printk("%s: Deferred resume completed\n", mmc_hostname(host));
+	return 0;
+}
+
+EXPORT_SYMBOL(mmc_resume_bus);
 
 /*
  * Assign a mmc bus handler to a host. Only one bus handler may control a
@@ -1056,9 +1127,16 @@ void mmc_rescan(struct work_struct *work)
 	struct mmc_host *host =
 		container_of(work, struct mmc_host, detect.work);
 	u32 ocr;
-	int err;
+	int err=0;
 	unsigned long flags;
+	int extend_wakelock = 0;
 
+	int result = 0;
+	struct bcmsdhc_host *sd_vreg = mmc_priv(host);
+
+	host->damaged_sd_card = 0;
+
+	printk("%s: %s start\n", mmc_hostname(host), __func__);
 	spin_lock_irqsave(&host->lock, flags);
 
 	if (host->rescan_disable) {
@@ -1074,6 +1152,12 @@ void mmc_rescan(struct work_struct *work)
 	/* if there is a card registered, check whether it is still present */
 	if ((host->bus_ops != NULL) && host->bus_ops->detect && !host->bus_dead)
 		host->bus_ops->detect(host);
+
+	/* If the card was removed the bus will be marked
+	 * as dead - extend the wakelock so userspace
+	 * can respond */
+	if (host->bus_dead)
+		extend_wakelock = 1;
 
 	mmc_bus_put(host);
 
@@ -1109,9 +1193,14 @@ void mmc_rescan(struct work_struct *work)
 	 * First we search for SDIO...
 	 */
 	err = mmc_send_io_op_cond(host, 0, &ocr);
-	if (!err) {
+	if (!err) 
+	{
 		if (mmc_attach_sdio(host, ocr))
+		{
 			mmc_power_off(host);
+			host->damaged_sd_card = 1;
+		}
+		extend_wakelock = 1;
 		goto out;
 	}
 
@@ -1119,9 +1208,14 @@ void mmc_rescan(struct work_struct *work)
 	 * ...then normal SD...
 	 */
 	err = mmc_send_app_op_cond(host, 0, &ocr);
-	if (!err) {
+	if (!err) 
+	{
 		if (mmc_attach_sd(host, ocr))
+		{
 			mmc_power_off(host);
+			host->damaged_sd_card = 1;
+		}			
+		extend_wakelock = 1;
 		goto out;
 	}
 
@@ -1129,9 +1223,14 @@ void mmc_rescan(struct work_struct *work)
 	 * ...and finally MMC.
 	 */
 	err = mmc_send_op_cond(host, 0, &ocr);
-	if (!err) {
+	if (!err) 
+	{
 		if (mmc_attach_mmc(host, ocr))
+		{
 			mmc_power_off(host);
+			host->damaged_sd_card = 1;
+		}
+		extend_wakelock = 1;
 		goto out;
 	}
 
@@ -1139,8 +1238,36 @@ void mmc_rescan(struct work_struct *work)
 	mmc_power_off(host);
 
 out:
+	// -- Turn off power of sd card when the set detect the worng sd card.
+	if(!strcmp(mmc_hostname(host), "mmc1"))
+	{
+		if(err == -110 || host->damaged_sd_card == 1)
+		{
+			if(sd_vreg->vcc)
+			{
+			/*	----------------------------------------------------------------------------------------------------- 
+				printk(KERN_INFO "%s's vreg: Name %s / Use Count %d / Open Count %d\n", mmc_hostname(sd_vreg->mmc), 
+						sd_vreg->vcc->supply_name, sd_vreg->vcc->rdev->use_count, sd_vreg->vcc->rdev->open_count);
+				----------------------------------------------------------------------------------------------------- */
+				result = regulator_disable(sd_vreg->vcc);
+				printk(KERN_INFO "%s's vreg[Turn Off]: Name %s / Use Count %d / Open Count %d / Result %d\n", mmc_hostname(sd_vreg->mmc),
+						sd_vreg->vcc->supply_name, sd_vreg->vcc->rdev->use_count, sd_vreg->vcc->rdev->open_count, result);
+			}
+		}
+		host->damaged_sd_card = 0;
+	}
+	
+	printk("%s: %s rescann is out\n", mmc_hostname(host), __func__);
+	if (extend_wakelock)
+		wake_lock_timeout(&mmc_delayed_work_wake_lock, HZ / 2);
+	else
+		wake_unlock(&mmc_delayed_work_wake_lock);
+
 	if (host->caps & MMC_CAP_NEEDS_POLL)
+	{
+		printk("%s : schedule host->detect(mmc_sd_detect)\n",__func__);
 		mmc_schedule_delayed_work(&host->detect, HZ);
+	}
 }
 
 void mmc_start_host(struct mmc_host *host)
@@ -1268,6 +1395,9 @@ int mmc_suspend_host(struct mmc_host *host)
 {
 	int err = 0;
 
+	if (mmc_bus_needs_resume(host))
+		return 0;
+
 	if (host->caps & MMC_CAP_DISABLE)
 		cancel_delayed_work(&host->disable);
 	cancel_delayed_work(&host->detect);
@@ -1297,6 +1427,12 @@ int mmc_resume_host(struct mmc_host *host)
 	int err = 0;
 
 	mmc_bus_get(host);
+	if (mmc_bus_manual_resume(host)) {
+		host->bus_resume_flags |= MMC_BUSRESUME_NEEDS_RESUME;
+		mmc_bus_put(host);
+		return 0;
+	}
+
 	if (host->bus_ops && !host->bus_dead) {
 		if (!(host->pm_flags & MMC_PM_KEEP_POWER)) {
 			mmc_power_up(host);
@@ -1334,6 +1470,10 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 	case PM_SUSPEND_PREPARE:
 
 		spin_lock_irqsave(&host->lock, flags);
+		if (mmc_bus_needs_resume(host)) {
+			spin_unlock_irqrestore(&host->lock, flags);
+			break;
+		}
 		host->rescan_disable = 1;
 		spin_unlock_irqrestore(&host->lock, flags);
 		cancel_delayed_work_sync(&host->detect);
@@ -1355,8 +1495,13 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 	case PM_POST_HIBERNATION:
 
 		spin_lock_irqsave(&host->lock, flags);
+		if (mmc_bus_manual_resume(host)) {
+			spin_unlock_irqrestore(&host->lock, flags);
+			break;
+		}
 		host->rescan_disable = 0;
 		spin_unlock_irqrestore(&host->lock, flags);
+		if (!host->card || host->card->type != MMC_TYPE_SDIO)
 		mmc_detect_change(host, 0);
 
 	}
@@ -1365,9 +1510,27 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 }
 #endif
 
+#ifdef CONFIG_MMC_EMBEDDED_SDIO
+void mmc_set_embedded_sdio_data(struct mmc_host *host,
+				struct sdio_cis *cis,
+				struct sdio_cccr *cccr,
+				struct sdio_embedded_func *funcs,
+				int num_funcs)
+{
+	host->embedded_sdio_data.cis = cis;
+	host->embedded_sdio_data.cccr = cccr;
+	host->embedded_sdio_data.funcs = funcs;
+	host->embedded_sdio_data.num_funcs = num_funcs;
+}
+
+EXPORT_SYMBOL(mmc_set_embedded_sdio_data);
+#endif
+
 static int __init mmc_init(void)
 {
 	int ret;
+
+	wake_lock_init(&mmc_delayed_work_wake_lock, WAKE_LOCK_SUSPEND, "mmc_delayed_work");
 
 	workqueue = create_singlethread_workqueue("kmmcd");
 	if (!workqueue)
@@ -1403,6 +1566,7 @@ static void __exit mmc_exit(void)
 	mmc_unregister_host_class();
 	mmc_unregister_bus();
 	destroy_workqueue(workqueue);
+	wake_lock_destroy(&mmc_delayed_work_wake_lock);
 }
 
 subsys_initcall(mmc_init);
